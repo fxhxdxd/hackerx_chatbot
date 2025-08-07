@@ -65,12 +65,10 @@ def get_model(model_type: str):
             model = HuggingFaceEmbeddings(
                 model_name=EMBEDDING_MODEL_NAME,
                 model_kwargs={
-                    'device': 'cpu',  # Force CPU to save memory
-                    'trust_remote_code': False  # Security + speed
+                    'device': 'cpu'  # Force CPU to save memory
                 },
                 encode_kwargs={
-                    'batch_size': 8,  # Smaller batch for memory
-                    'show_progress_bar': False  # Reduce overhead
+                    'batch_size': 8  # Smaller batch for memory
                 }
             )
             _models[model_type] = model
@@ -85,7 +83,7 @@ def get_model(model_type: str):
                 temperature=0.0, 
                 google_api_key=GOOGLE_API_KEY,
                 max_retries=1,  # Reduce retries to save time
-                request_timeout=30  # Add timeout
+                timeout=30  # Correct parameter name
             )
             _models[model_type] = model
             return model
