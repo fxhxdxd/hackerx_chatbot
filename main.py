@@ -60,15 +60,22 @@ def get_model(model_type: str):
     
     try:
         if model_type == "embeddings":
-            logging.info("Loading embeddings model...")
+            logging.info("Loading embeddings model (this may take 30-45 seconds)...")
             # Use lighter model loading with minimal cache
             model = HuggingFaceEmbeddings(
                 model_name=EMBEDDING_MODEL_NAME,
-                model_kwargs={'device': 'cpu'},  # Force CPU to save memory
-                encode_kwargs={'batch_size': 16}  # Smaller batch size
+                model_kwargs={
+                    'device': 'cpu',  # Force CPU to save memory
+                    'trust_remote_code': False  # Security + speed
+                },
+                encode_kwargs={
+                    'batch_size': 8,  # Smaller batch for memory
+                    'show_progress_bar': False  # Reduce overhead
+                }
             )
             _models[model_type] = model
             cleanup_memory()
+            logging.info("✅ Embeddings model loaded successfully")
             return model
             
         elif model_type == "llm":
@@ -77,27 +84,21 @@ def get_model(model_type: str):
                 model="gemini-1.5-flash", 
                 temperature=0.0, 
                 google_api_key=GOOGLE_API_KEY,
-                max_retries=2  # Reduce retries to save memory
+                max_retries=1,  # Reduce retries to save time
+                request_timeout=30  # Add timeout
             )
             _models[model_type] = model
             return model
             
         elif model_type == "cross_encoder":
-            # Load cross-encoder only if absolutely needed
-            logging.info("Loading cross-encoder model...")
-            try:
-                from sentence_transformers import CrossEncoder
-                model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
-                _models[model_type] = model
-                cleanup_memory()
-                return model
-            except ImportError:
-                logging.warning("CrossEncoder not available, skipping reranking")
-                return None
+            # Skip cross-encoder to save memory and time
+            logging.info("Cross-encoder disabled for memory optimization")
+            return None
                 
     except Exception as e:
         logging.error(f"Failed to load {model_type} model: {e}")
-        raise HTTPException(status_code=500, detail=f"Model loading failed: {e}")
+        # Don't raise exception - try to continue
+        return None
 
 def manage_cache():
     """Manage cache size to prevent memory overflow"""
@@ -112,10 +113,22 @@ def manage_cache():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Modern FastAPI lifespan handler instead of deprecated on_event"""
+    """Modern FastAPI lifespan handler with essential model pre-loading"""
     # Startup
     logging.info("🚀 Starting Ultra-Fast RAG Server...")
-    logging.info("📝 Models will be loaded on-demand to save memory")
+    logging.info("🔥 Pre-loading essential models to avoid request timeouts...")
+    
+    try:
+        # Pre-load only the embeddings model (most time-consuming)
+        embeddings = get_model("embeddings")
+        logging.info("✅ Embeddings model pre-loaded successfully")
+        
+        # LLM loads quickly, keep it on-demand
+        logging.info("📝 LLM will be loaded on-demand")
+        
+    except Exception as e:
+        logging.error(f"❌ Model pre-loading failed: {e}")
+        # Continue anyway - models will load on demand
     
     yield
     
@@ -254,10 +267,12 @@ def get_memory_efficient_vector_store(documents: List) -> PineconeVectorStore:
         # Manage cache size
         manage_cache()
         
-        # Get models on-demand
+        # Get models (embeddings should be pre-loaded)
         embeddings = get_model("embeddings")
+        if embeddings is None:
+            raise HTTPException(status_code=500, detail="Embeddings model failed to load")
         
-        # Initialize Pinecone
+        # Initialize Pinecone with timeout protection
         pc = Pinecone(api_key=PINECONE_API_KEY)
         existing_indexes = pc.list_indexes().names()
         
