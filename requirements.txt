@@ -7,9 +7,3 @@ langchain-community==0.3.0
 langchain-core==0.3.0
 langchain-google-genai==2.0.0
 langchain-huggingface==0.1.0
-langchain-pinecone==0.2.0
-pinecone-client==3.0.3
-sentence-transformers==2.6.1
-pypdf==3.17.4
-pydantic==2.7.4
-typing-extensions==4.9.0
