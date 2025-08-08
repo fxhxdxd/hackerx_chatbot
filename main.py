@@ -2,16 +2,15 @@ import os
 import logging
 import time
 import hashlib
-import re
+import gc
 import requests
 import uvicorn
-import gc
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, Security, status
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
-from typing import List, Dict, Optional
+from typing import List, Optional
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.prompts import PromptTemplate
 from langchain.chains import create_retrieval_chain
@@ -22,480 +21,511 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_pinecone import PineconeVectorStore
 from pinecone import Pinecone
 
-# --- Configuration ---
+# --- RENDER-OPTIMIZED CONFIG ---
 load_dotenv()
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()]  # Ensure logs go to stdout for Render
+)
 
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-EXPECTED_BEARER_TOKEN = "612aeb3ebe9d63cfdb21e3f7d679fcebde54f7c1283c92b7937ea72c10c966af"
+EXPECTED_BEARER_TOKEN = os.getenv("BEARER_TOKEN", "612aeb3ebe9d63cfdb21e3f7d679fcebde54f7c1283c92b7937ea72c10c966af")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "hackerx")
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
-# **MEMORY-OPTIMIZED GLOBAL VARIABLES**
-_models = {}  # Lazy-loaded models
-_vector_store_cache = {}  # Limited cache
-_namespace_timestamps = {}
-_cache_limit = 3  # Limit cache to prevent OOM
+# --- AGGRESSIVE MEMORY CONTROL ---
+_models = {}
+_vector_store_cache = {}
+_namespace_cache = {}
+_cache_limit = 2  # Reduced from 3 to save memory
+_max_chunks_per_doc = 100  # Limit document size
 
-class HackRxRequest(BaseModel):
-    documents: str = Field(..., description="URL to the PDF document")
-    questions: List[str] = Field(..., description="List of questions to ask about the document")
-
-class HackRxResponse(BaseModel):
-    answers: List[str] = Field(..., description="List of answers corresponding to the questions")
-
-api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
-
-def cleanup_memory():
-    """Force garbage collection to free memory"""
+def aggressive_cleanup():
+    """Aggressive memory cleanup for Render"""
+    global _models, _vector_store_cache
+    # Clear temporary variables
+    for obj in gc.get_objects():
+        if hasattr(obj, 'clear') and callable(obj.clear):
+            try:
+                obj.clear()
+            except:
+                pass
     gc.collect()
+    gc.collect()  # Double cleanup for Render
 
-def get_model(model_type: str):
-    """Lazy load models only when needed to save memory"""
-    global _models
-    
+def monitor_memory():
+    """Monitor memory usage and force cleanup if needed"""
+    try:
+        import psutil
+        mem_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+        if mem_mb > 450:  # Approaching 512MB limit
+            logging.warning(f"High memory usage: {mem_mb:.1f}MB - forcing cleanup")
+            aggressive_cleanup()
+        return mem_mb
+    except ImportError:
+        return 0
+
+# --- OPTIMIZED MODEL LOADING ---
+def get_model_safe(model_type: str):
+    """Safe model loading with memory monitoring"""
     if model_type in _models:
         return _models[model_type]
     
+    # Check memory before loading
+    monitor_memory()
+    
     try:
         if model_type == "embeddings":
-            logging.info("Loading embeddings model (this may take 30-45 seconds)...")
-            # Use lighter model loading with minimal cache
+            logging.info("Loading lightweight embeddings model...")
             model = HuggingFaceEmbeddings(
                 model_name=EMBEDDING_MODEL_NAME,
                 model_kwargs={
-                    'device': 'cpu'  # Force CPU to save memory
+                    "device": "cpu",
+                    "normalize_embeddings": True  # Better for similarity search
                 },
                 encode_kwargs={
-                    'batch_size': 8  # Smaller batch for memory
+                    "batch_size": 4,  # Smaller batch size for Render
+                    "convert_to_tensor": False,  # Save memory
+                    "normalize_embeddings": True
                 }
             )
             _models[model_type] = model
-            cleanup_memory()
-            logging.info("✅ Embeddings model loaded successfully")
+            aggressive_cleanup()
+            logging.info("✅ Embeddings model loaded")
             return model
             
         elif model_type == "llm":
-            logging.info("Loading LLM model...")
+            logging.info("Loading Gemini LLM...")
             model = ChatGoogleGenerativeAI(
-                model="gemini-1.5-flash", 
-                temperature=0.0, 
+                model="gemini-1.5-flash",
+                temperature=0.0,
                 google_api_key=GOOGLE_API_KEY,
-                max_retries=1,  # Reduce retries to save time
-                timeout=30  # Correct parameter name
+                max_retries=1,
+                timeout=25,  # Shorter timeout for Render
+                max_output_tokens=1024  # Limit response length
             )
             _models[model_type] = model
+            logging.info("✅ LLM loaded")
             return model
             
-        elif model_type == "cross_encoder":
-            # Skip cross-encoder to save memory and time
-            logging.info("Cross-encoder disabled for memory optimization")
-            return None
-                
     except Exception as e:
-        logging.error(f"Failed to load {model_type} model: {e}")
-        # Don't raise exception - try to continue
+        logging.error(f"Failed to load {model_type}: {e}")
+        # Don't crash - return None and handle gracefully
         return None
 
-def manage_cache():
-    """Manage cache size to prevent memory overflow"""
-    global _vector_store_cache
+def smart_cache_management():
+    """Intelligent cache management for Render"""
+    global _vector_store_cache, _namespace_cache
     
     if len(_vector_store_cache) >= _cache_limit:
-        # Remove oldest cache entry
-        oldest_key = min(_vector_store_cache.keys())
-        del _vector_store_cache[oldest_key]
-        logging.info(f"Removed cache entry: {oldest_key}")
-        cleanup_memory()
+        # Remove oldest entries
+        to_remove = len(_vector_store_cache) - _cache_limit + 1
+        for _ in range(to_remove):
+            if _vector_store_cache:
+                oldest_key = next(iter(_vector_store_cache))
+                del _vector_store_cache[oldest_key]
+                if oldest_key in _namespace_cache:
+                    del _namespace_cache[oldest_key]
+        aggressive_cleanup()
+        logging.info(f"Cache cleaned, {len(_vector_store_cache)} entries remaining")
 
+# --- RENDER-OPTIMIZED LIFESPAN ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Modern FastAPI lifespan handler with essential model pre-loading"""
-    # Startup
-    logging.info("🚀 Starting Ultra-Fast RAG Server...")
-    logging.info("🔥 Pre-loading essential models to avoid request timeouts...")
+    """Optimized startup for Render"""
+    logging.info("🚀 Starting Render-Optimized RAG System...")
     
+    # Pre-load only embeddings (most critical)
     try:
-        # Pre-load only the embeddings model (most time-consuming)
-        embeddings = get_model("embeddings")
-        logging.info("✅ Embeddings model pre-loaded successfully")
-        
-        # LLM loads quickly, keep it on-demand
-        logging.info("📝 LLM will be loaded on-demand")
-        
+        embeddings_model = get_model_safe("embeddings")
+        if embeddings_model:
+            logging.info("✅ Essential models pre-loaded")
+        else:
+            logging.warning("⚠️ Embeddings pre-load failed - will load on demand")
     except Exception as e:
-        logging.error(f"❌ Model pre-loading failed: {e}")
-        # Continue anyway - models will load on demand
+        logging.error(f"Startup error: {e} - continuing with on-demand loading")
+    
+    # Monitor initial memory
+    mem = monitor_memory()
+    logging.info(f"📊 Startup memory usage: {mem:.1f}MB")
     
     yield
     
-    # Shutdown
-    logging.info("🔄 Shutting down and cleaning up...")
-    global _models, _vector_store_cache
+    # Cleanup on shutdown
+    logging.info("🔄 Shutting down...")
     _models.clear()
     _vector_store_cache.clear()
-    cleanup_memory()
+    _namespace_cache.clear()
+    aggressive_cleanup()
     logging.info("✅ Cleanup complete")
 
-# Initialize FastAPI with lifespan
+# --- FASTAPI APP ---
 app = FastAPI(
-    title="Memory-Optimized RAG System",
-    description="Production RAG system optimized for Render's 512MB memory limit",
-    version="8.0.0",
+    title="Render-Optimized RAG System",
+    description="Memory-optimized RAG system designed for Render's 512MB limit",
+    version="10.0.0",
+    lifespan=lifespan,
     docs_url="/docs",
-    redoc_url="/redoc",
-    lifespan=lifespan
+    redoc_url="/redoc"
 )
 
+api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
+
 async def verify_token(auth_header: str = Security(api_key_header)):
-    if auth_header is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authorization header is missing")
+    if not auth_header:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, 
+            detail="Authorization header missing"
+        )
     try:
-        scheme, token = auth_header.split()
+        scheme, token = auth_header.split(maxsplit=1)
         if scheme.lower() != "bearer" or token != EXPECTED_BEARER_TOKEN:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid authentication credentials")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, 
+                detail="Invalid credentials"
+            )
     except ValueError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authorization header format")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, 
+            detail="Invalid authorization format"
+        )
     return token
 
+# --- DATA MODELS ---
+class HackRxRequest(BaseModel):
+    documents: str = Field(..., description="URL to the PDF document")
+    questions: List[str] = Field(..., description="List of questions")
+
+class HackRxResponse(BaseModel):
+    answers: List[str] = Field(..., description="List of answers")
+
+# --- MEMORY-EFFICIENT DOCUMENT PROCESSING ---
 def get_document_hash(documents: List) -> str:
-    """Generate unique hash for document content"""
-    content = "".join([doc.page_content[:100] for doc in documents[:5]])  # Reduced sample size
+    """Generate hash for caching"""
+    if not documents:
+        return "empty"
+    # Use smaller sample for hash to save memory
+    content = "".join([doc.page_content[:50] for doc in documents[:3]])
     return hashlib.md5(content.encode()).hexdigest()[:8]
 
-def detect_document_type(documents: List) -> str:
-    """Lightweight document type detection"""
-    if not documents:
-        return "general"
-        
-    sample_text = " ".join([doc.page_content[:200] for doc in documents[:2]]).lower()
-    
-    if any(term in sample_text for term in ["policy", "insurance", "premium"]):
-        return "insurance"
-    elif any(term in sample_text for term in ["contract", "agreement"]):
-        return "legal"
-    else:
-        return "general"
-
-def memory_efficient_chunking(documents: List, doc_type: str) -> List:
-    """Memory-efficient chunking with smaller chunks"""
-    chunk_configs = {
-        "insurance": {"size": 800, "overlap": 100},  # Smaller chunks
-        "legal": {"size": 850, "overlap": 120},
-        "general": {"size": 750, "overlap": 80}
-    }
-    
-    config = chunk_configs.get(doc_type, chunk_configs["general"])
-    
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=config["size"],
-        chunk_overlap=config["overlap"],
-        separators=["\n\n", "\n", ". ", " "],
-        length_function=len,
-    )
-    
-    chunks = text_splitter.split_documents(documents)
-    cleanup_memory()  # Clean up after chunking
-    return chunks
-
-def load_document_efficiently(url: str) -> List:
-    """Memory-efficient document loading"""
-    logging.info(f"Loading document from: {url}")
-    
-    temp_file_path = None
+def render_optimized_document_processing(url: str) -> List:
+    """Memory-efficient document processing for Render"""
+    temp_file = None
     try:
-        response = requests.get(url, timeout=15, stream=True)  # Stream to save memory
+        logging.info(f"📄 Downloading: {url}")
+        
+        # Stream download to save memory
+        response = requests.get(url, timeout=20, stream=True)
         response.raise_for_status()
-
-        temp_file_path = "temp_doc.pdf"
         
-        # Stream write to save memory
-        with open(temp_file_path, "wb") as temp_f:
-            for chunk in response.iter_content(chunk_size=8192):
-                temp_f.write(chunk)
-
-        loader = PyPDFLoader(temp_file_path)
+        temp_file = f"temp_{int(time.time())}.pdf"
+        with open(temp_file, "wb") as f:
+            for chunk in response.iter_content(chunk_size=4096):  # Smaller chunks
+                if chunk:
+                    f.write(chunk)
+        
+        # Load and process document
+        loader = PyPDFLoader(temp_file)
         docs = loader.load()
-
-        # Clean up immediately
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-
-        # Process with memory efficiency
-        doc_type = detect_document_type(docs)
-        split_docs = memory_efficient_chunking(docs, doc_type)
         
-        logging.info(f"Document processed: {len(split_docs)} chunks, type: {doc_type}")
-        cleanup_memory()
+        # Clean up temp file immediately
+        os.remove(temp_file)
+        temp_file = None
         
-        return split_docs
-
+        if not docs:
+            raise HTTPException(status_code=400, detail="No content extracted from PDF")
+        
+        # Optimized chunking for Render
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=800,  # Smaller chunks for memory efficiency
+            chunk_overlap=100,  # Reduced overlap
+            separators=["\n\n", "\n", ". ", ".", " "],
+            length_function=len
+        )
+        
+        chunks = splitter.split_documents(docs)
+        
+        # Limit chunks to prevent OOM
+        if len(chunks) > _max_chunks_per_doc:
+            logging.warning(f"Limiting chunks from {len(chunks)} to {_max_chunks_per_doc}")
+            chunks = chunks[:_max_chunks_per_doc]
+        
+        logging.info(f"✅ Created {len(chunks)} chunks")
+        
+        # Cleanup before returning
+        del docs, response
+        aggressive_cleanup()
+        
+        return chunks
+        
     except Exception as e:
-        if temp_file_path and os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-        raise HTTPException(status_code=500, detail=f"Document processing failed: {e}")
+        if temp_file and os.path.exists(temp_file):
+            os.remove(temp_file)
+        logging.error(f"Document processing failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Document processing failed: {str(e)}")
 
-def monitor_storage_usage(index) -> float:
-    """Lightweight storage monitoring"""
-    try:
-        stats = index.describe_index_stats()
-        current_vectors = stats.total_vector_count
-        estimated_storage_mb = current_vectors * 0.004
-        storage_usage_percent = (estimated_storage_mb / 2000) * 100
-        return storage_usage_percent
-    except Exception:
-        return 0.0
-
-def get_memory_efficient_vector_store(documents: List) -> PineconeVectorStore:
-    """Memory-efficient vector store creation"""
-    
+# --- MEMORY-EFFICIENT VECTOR STORE ---
+def create_memory_efficient_vector_store(documents: List) -> PineconeVectorStore:
+    """Create vector store optimized for Render's memory constraints"""
     start_time = time.time()
-    logging.info("Creating memory-efficient vector store...")
     
     try:
         # Check cache first
         doc_hash = get_document_hash(documents)
-        cache_key = f"doc_{doc_hash}"
+        cache_key = f"vs_{doc_hash}"
         
         if cache_key in _vector_store_cache:
-            logging.info(f"Using cached vector store: {doc_hash}")
+            logging.info(f"📦 Using cached vector store: {doc_hash}")
             return _vector_store_cache[cache_key]
         
-        # Manage cache size
-        manage_cache()
+        # Manage cache before creating new store
+        smart_cache_management()
         
-        # Get models (embeddings should be pre-loaded)
-        embeddings = get_model("embeddings")
-        if embeddings is None:
+        # Get embeddings model
+        embeddings = get_model_safe("embeddings")
+        if not embeddings:
             raise HTTPException(status_code=500, detail="Embeddings model failed to load")
         
-        # Initialize Pinecone with timeout protection
+        # Initialize Pinecone
         pc = Pinecone(api_key=PINECONE_API_KEY)
-        existing_indexes = pc.list_indexes().names()
+        indexes = pc.list_indexes().names()
         
-        if PINECONE_INDEX_NAME not in existing_indexes:
-            alternatives = ["hackerx", "bajajhackerx"]
-            index_name = next((alt for alt in alternatives if alt in existing_indexes), 
-                            existing_indexes[0] if existing_indexes else None)
-            if not index_name:
-                raise HTTPException(status_code=404, detail="No suitable index found")
-        else:
+        # Select index
+        if PINECONE_INDEX_NAME in indexes:
             index_name = PINECONE_INDEX_NAME
-        
-        index = pc.Index(index_name)
+        elif "hackerx" in indexes:
+            index_name = "hackerx"
+        elif "bajajhackerx" in indexes:
+            index_name = "bajajhackerx"
+        else:
+            index_name = indexes[0] if indexes else None
+            
+        if not index_name:
+            raise HTTPException(status_code=404, detail="No suitable Pinecone index found")
         
         # Create unique namespace
         namespace = f"doc_{doc_hash}_{int(time.time())}"
-        _namespace_timestamps[namespace] = time.time()
         
-        # Process documents in smaller batches to save memory
+        # Process documents in small batches to avoid memory spikes
+        logging.info("🔄 Processing documents in memory-efficient batches...")
+        
         texts = [doc.page_content for doc in documents]
-        metadatas = [doc.metadata for doc in documents]
+        metadatas = [{"text": doc.page_content[:300]} for doc in documents]  # Limit metadata size
         
-        # Smaller batch size for memory efficiency
-        batch_size = 16  # Reduced from 32
-        vectors_to_upsert = []
-        
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i+batch_size]
-            batch_embeddings = embeddings.embed_documents(batch_texts)
-            
-            # Process this batch immediately
-            for j, (text, embedding, metadata) in enumerate(zip(batch_texts, batch_embeddings, metadatas[i:i+batch_size])):
-                limited_metadata = {
-                    "text": text[:500],  # Further reduced
-                    **{k: str(v)[:50] for k, v in metadata.items() if k != "text"}
-                }
-                
-                vectors_to_upsert.append({
-                    "id": f"{namespace}_{i+j}",
-                    "values": embedding,
-                    "metadata": limited_metadata
-                })
-            
-            # Upsert when batch is ready and clear memory
-            if len(vectors_to_upsert) >= 50:  # Smaller upsert batches
-                index.upsert(vectors=vectors_to_upsert, namespace=namespace)
-                vectors_to_upsert.clear()
-                cleanup_memory()
-                
-            logging.info(f"Processed batch {i//batch_size + 1}/{(len(texts)-1)//batch_size + 1}")
-        
-        # Upsert remaining vectors
-        if vectors_to_upsert:
-            index.upsert(vectors=vectors_to_upsert, namespace=namespace)
-            cleanup_memory()
-        
-        # Create vector store
-        vector_store = PineconeVectorStore(
-            index=index,
+        # Create vector store with batch processing
+        vector_store = PineconeVectorStore.from_texts(
+            texts=texts,
             embedding=embeddings,
-            namespace=namespace,
-            text_key="text"
+            metadatas=metadatas,
+            index_name=index_name,
+            namespace=namespace
         )
         
-        # Cache with memory management
+        # Cache the result
         _vector_store_cache[cache_key] = vector_store
+        _namespace_cache[cache_key] = namespace
         
-        elapsed_time = time.time() - start_time
-        logging.info(f"Memory-efficient vector store created in {elapsed_time:.2f}s")
+        # Cleanup
+        del texts, metadatas
+        aggressive_cleanup()
+        
+        elapsed = time.time() - start_time
+        logging.info(f"✅ Vector store created in {elapsed:.1f}s")
         
         return vector_store
-
+        
     except Exception as e:
-        elapsed_time = time.time() - start_time
-        logging.error(f"Vector store creation failed after {elapsed_time:.2f}s: {e}")
-        cleanup_memory()
-        raise HTTPException(status_code=500, detail=f"Vector store error: {e}")
+        aggressive_cleanup()
+        logging.error(f"Vector store creation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Vector store creation failed: {str(e)}")
 
-def create_lightweight_chain(vector_store: PineconeVectorStore):
-    """Create lightweight RAG chain"""
-    llm = get_model("llm")
+# --- LIGHTWEIGHT RAG CHAIN ---
+def create_render_optimized_chain(vector_store: PineconeVectorStore):
+    """Create memory-efficient RAG chain"""
+    llm = get_model_safe("llm")
+    if not llm:
+        raise HTTPException(status_code=500, detail="LLM failed to load")
     
     # Simplified prompt to reduce memory usage
-    prompt_template = """Answer the question based on the context provided. Be specific and accurate.
+    prompt_template = """Answer the question based on the provided context. Be specific and accurate.
 
 Context: {context}
-Question: {input}
-Answer:"""
 
+Question: {input}
+
+Answer:"""
+    
     prompt = PromptTemplate.from_template(prompt_template)
     document_chain = create_stuff_documents_chain(llm, prompt)
+    
+    # Use smaller retrieval count for memory efficiency
     retrieval_chain = create_retrieval_chain(
-        vector_store.as_retriever(search_kwargs={"k": 6}),  # Reduced retrieval count
+        vector_store.as_retriever(search_kwargs={"k": 6}),  # Reduced from 10
         document_chain
     )
-
+    
     return retrieval_chain
 
+# --- OPTIMIZED QUESTION PROCESSING ---
+async def process_questions_efficiently(questions: List[str], rag_chain) -> List[str]:
+    """Process questions with memory monitoring"""
+    answers = []
+    
+    for i, question in enumerate(questions, 1):
+        try:
+            # Monitor memory before each question
+            mem_usage = monitor_memory()
+            
+            if mem_usage > 480:  # Critical memory usage
+                logging.warning(f"Critical memory usage: {mem_usage:.1f}MB - forcing cleanup")
+                aggressive_cleanup()
+            
+            # Process question
+            result = rag_chain.invoke({"input": question.strip()})
+            answer = result.get("answer", "Information not found in the provided context.")
+            answers.append(answer)
+            
+            # Cleanup every 2 questions on Render
+            if i % 2 == 0:
+                aggressive_cleanup()
+            
+            logging.info(f"✅ Question {i}/{len(questions)} processed")
+            
+        except Exception as e:
+            logging.error(f"❌ Question {i} failed: {e}")
+            answers.append(f"Error processing question: {str(e)}")
+            aggressive_cleanup()  # Cleanup on error
+    
+    return answers
+
+# --- MAIN ENDPOINT ---
 @app.post("/hackrx/run", response_model=HackRxResponse, dependencies=[Depends(verify_token)])
 async def run_submission(request: HackRxRequest):
-    """Memory-optimized processing for Render"""
-    
-    total_start = time.time()
-    logging.info("Starting memory-optimized processing...")
+    """Render-optimized main processing endpoint"""
+    start_time = time.time()
     
     try:
-        # Load and process document
-        documents = load_document_efficiently(request.documents)
-        vector_store = get_memory_efficient_vector_store(documents)
-        rag_chain = create_lightweight_chain(vector_store)
+        logging.info(f"🚀 Processing {len(request.questions)} questions...")
         
-        # Process questions with memory management
-        answers = []
+        # Monitor initial memory
+        initial_mem = monitor_memory()
+        logging.info(f"📊 Initial memory: {initial_mem:.1f}MB")
         
-        for i, question in enumerate(request.questions, 1):
-            try:
-                response = rag_chain.invoke({"input": question})
-                answer = response.get("answer", "Could not generate an answer.")
-                answers.append(answer)
-                
-                # Clean up after each question
-                if i % 3 == 0:  # Cleanup every 3 questions
-                    cleanup_memory()
-                
-                logging.info(f"Question {i}/{len(request.questions)} processed")
-                
-            except Exception as e:
-                logging.error(f"Error processing question {i}: {e}")
-                answers.append(f"Error: {str(e)}")
+        # Process document
+        documents = render_optimized_document_processing(request.documents)
         
-        total_time = time.time() - total_start
-        logging.info(f"Processing completed in {total_time:.2f}s")
+        # Create vector store
+        vector_store = create_memory_efficient_vector_store(documents)
+        
+        # Create RAG chain
+        rag_chain = create_render_optimized_chain(vector_store)
+        
+        # Process questions
+        answers = await process_questions_efficiently(request.questions, rag_chain)
         
         # Final cleanup
-        cleanup_memory()
+        aggressive_cleanup()
+        
+        # Report performance
+        total_time = time.time() - start_time
+        final_mem = monitor_memory()
+        logging.info(f"✅ Completed in {total_time:.1f}s, memory: {final_mem:.1f}MB")
         
         return HackRxResponse(answers=answers)
-
+        
     except HTTPException:
-        cleanup_memory()
+        aggressive_cleanup()
         raise
     except Exception as e:
-        cleanup_memory()
-        total_time = time.time() - total_start
-        logging.error(f"Processing failed after {total_time:.2f}s: {e}")
+        aggressive_cleanup()
+        logging.error(f"❌ Processing failed: {e}")
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
+# --- UTILITY ENDPOINTS ---
 @app.get("/health")
 async def health_check():
+    mem = monitor_memory()
     return {
-        "status": "healthy", 
-        "message": "Memory-Optimized RAG API for Render", 
-        "version": "8.0.0",
-        "memory_optimization": "Enabled"
+        "status": "healthy",
+        "version": "10.0.0",
+        "memory_mb": round(mem, 1),
+        "message": "Render-Optimized RAG System"
     }
 
 @app.get("/")
 async def root():
     return {
-        "message": "Memory-Optimized RAG System for Render",
-        "version": "8.0.0",
+        "message": "Render-Optimized RAG System",
+        "version": "10.0.0",
         "optimizations": [
-            "Lazy model loading",
-            "Memory-efficient chunking",
-            "Limited caching (3 entries max)",
-            "Aggressive garbage collection",
-            "Streaming document loading",
-            "Smaller batch sizes"
+            "Aggressive memory management",
+            "Batch processing with cleanup",
+            "Limited document chunks (100 max)",
+            "Smart caching (2 entries max)",
+            "Memory monitoring",
+            "Render-specific tuning"
         ],
-        "memory_limit": "512MB (Render compatible)"
+        "memory_limit": "512MB",
+        "platform": "Render"
     }
 
 @app.get("/memory-status")
 async def memory_status():
-    """Check memory usage status"""
-    import psutil
-    import os
-    
-    try:
-        process = psutil.Process(os.getpid())
-        memory_mb = process.memory_info().rss / 1024 / 1024
-        
-        return {
-            "memory_usage_mb": round(memory_mb, 2),
-            "memory_percent": round(memory_mb / 512 * 100, 2),  # 512MB limit
-            "cached_models": list(_models.keys()),
-            "cached_vector_stores": len(_vector_store_cache),
-            "status": "OK" if memory_mb < 400 else "WARNING" if memory_mb < 480 else "CRITICAL"
-        }
-    except ImportError:
-        return {"error": "psutil not available for memory monitoring"}
+    """Detailed memory status for monitoring"""
+    mem = monitor_memory()
+    return {
+        "memory_mb": round(mem, 1),
+        "memory_percent": round((mem / 512) * 100, 1),
+        "status": "OK" if mem < 350 else "WARNING" if mem < 450 else "CRITICAL",
+        "models_loaded": list(_models.keys()),
+        "vector_stores_cached": len(_vector_store_cache),
+        "cache_limit": _cache_limit,
+        "recommendations": [
+            "Clear cache if memory > 80%" if mem > 400 else "Memory usage normal",
+            f"Current usage: {(mem/512)*100:.1f}% of 512MB limit"
+        ]
+    }
 
-@app.post("/clear-memory")
-async def clear_memory():
-    """Force memory cleanup"""
-    global _models, _vector_store_cache
-    
-    models_cleared = len(_models)
-    cache_cleared = len(_vector_store_cache)
+@app.post("/clear-cache")
+async def clear_cache():
+    """Emergency cache clearing endpoint"""
+    cleared_models = len(_models)
+    cleared_cache = len(_vector_store_cache)
     
     _models.clear()
     _vector_store_cache.clear()
-    cleanup_memory()
+    _namespace_cache.clear()
+    aggressive_cleanup()
+    
+    new_mem = monitor_memory()
     
     return {
-        "message": "Memory cleared",
-        "models_cleared": models_cleared,
-        "cache_entries_cleared": cache_cleared
+        "message": "Cache cleared successfully",
+        "models_cleared": cleared_models,
+        "cache_cleared": cleared_cache,
+        "memory_after_cleanup_mb": round(new_mem, 1),
+        "status": "success"
     }
 
+# --- MAIN ---
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    print("🚀 Starting Memory-Optimized RAG Server for Render...")
+    port = int(os.getenv("PORT", 8000))
+    print("🚀 Starting Render-Optimized RAG System...")
     print("💾 Memory Limit: 512MB")
-    print("🔧 Optimizations: Lazy loading + Limited caching + Garbage collection")
-    print(f"🎯 Running on port {port}")
-    print("📚 API docs: /docs")
-    print("💚 Health check: /health")
-    print("📊 Memory status: /memory-status")
-    print("🧹 Clear memory: /clear-memory")
+    print("🔧 Optimizations: Aggressive cleanup + Smart caching + Memory monitoring")
+    print(f"🎯 Port: {port}")
+    print("📚 Docs: /docs")
+    print("💚 Health: /health")
+    print("📊 Memory: /memory-status")
     
     uvicorn.run(
         app, 
         host="0.0.0.0", 
         port=port,
-        workers=1,  # Single worker to save memory
-        reload=False  # Disable reload to save memory
+        workers=1,
+        reload=False,
+        access_log=False,  # Reduce logging overhead
+        log_level="info"
     )
