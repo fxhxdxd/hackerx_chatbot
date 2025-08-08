@@ -1,531 +1,581 @@
 import os
+import io
 import logging
 import time
-import hashlib
 import gc
+from typing import List, Tuple, Optional, Union, Dict, Any
+import re
+import math
+from collections import Counter
+import hashlib
+
 import requests
 import uvicorn
-from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+
 from fastapi import FastAPI, Depends, HTTPException, Security, status
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
-from typing import List, Optional
+
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.prompts import PromptTemplate
-from langchain.chains import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain.schema import Document
+from langchain.schema.runnable import RunnablePassthrough
+from langchain.schema.output_parser import StrOutputParser
+
 from langchain_community.document_loaders import PyPDFLoader
+
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_pinecone import PineconeVectorStore
-from pinecone import Pinecone
 
-# --- RENDER-OPTIMIZED CONFIG ---
+from pinecone import Pinecone, ServerlessSpec
+
+# --- Configuration ---
 load_dotenv()
-logging.basicConfig(
-    level=logging.INFO, 
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler()]  # Ensure logs go to stdout for Render
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-EXPECTED_BEARER_TOKEN = os.getenv("BEARER_TOKEN", "612aeb3ebe9d63cfdb21e3f7d679fcebde54f7c1283c92b7937ea72c10c966af")
-PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "hackerx")
+EXPECTED_BEARER_TOKEN = "612aeb3ebe9d63cfdb21e3f7d679fcebde54f7c1283c92b7937ea72c10c966af"
+PINECONE_INDEX_NAME = "hackrx" 
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
-# --- AGGRESSIVE MEMORY CONTROL ---
-_models = {}
-_vector_store_cache = {}
-_namespace_cache = {}
-_cache_limit = 2  # Reduced from 3 to save memory
-_max_chunks_per_doc = 100  # Limit document size
+if not all([PINECONE_API_KEY, GOOGLE_API_KEY]):
+    raise ValueError("API keys for Pinecone and Google are not set in the environment variables.")
 
-def aggressive_cleanup():
-    """Aggressive memory cleanup for Render"""
-    global _models, _vector_store_cache
-    # Clear temporary variables
-    for obj in gc.get_objects():
-        if hasattr(obj, 'clear') and callable(obj.clear):
-            try:
-                obj.clear()
-            except:
-                pass
-    gc.collect()
-    gc.collect()  # Double cleanup for Render
-
-def monitor_memory():
-    """Monitor memory usage and force cleanup if needed"""
-    try:
-        import psutil
-        mem_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
-        if mem_mb > 450:  # Approaching 512MB limit
-            logging.warning(f"High memory usage: {mem_mb:.1f}MB - forcing cleanup")
-            aggressive_cleanup()
-        return mem_mb
-    except ImportError:
-        return 0
-
-# --- OPTIMIZED MODEL LOADING ---
-def get_model_safe(model_type: str):
-    """Safe model loading with memory monitoring"""
-    if model_type in _models:
-        return _models[model_type]
-    
-    # Check memory before loading
-    monitor_memory()
-    
-    try:
-        if model_type == "embeddings":
-            logging.info("Loading lightweight embeddings model...")
-            model = HuggingFaceEmbeddings(
-                model_name=EMBEDDING_MODEL_NAME,
-                model_kwargs={
-                    "device": "cpu",
-                    "normalize_embeddings": True  # Better for similarity search
-                },
-                encode_kwargs={
-                    "batch_size": 4,  # Smaller batch size for Render
-                    "convert_to_tensor": False,  # Save memory
-                    "normalize_embeddings": True
-                }
-            )
-            _models[model_type] = model
-            aggressive_cleanup()
-            logging.info("✅ Embeddings model loaded")
-            return model
-            
-        elif model_type == "llm":
-            logging.info("Loading Gemini LLM...")
-            model = ChatGoogleGenerativeAI(
-                model="gemini-1.5-flash",
-                temperature=0.0,
-                google_api_key=GOOGLE_API_KEY,
-                max_retries=1,
-                timeout=25,  # Shorter timeout for Render
-                max_output_tokens=1024  # Limit response length
-            )
-            _models[model_type] = model
-            logging.info("✅ LLM loaded")
-            return model
-            
-    except Exception as e:
-        logging.error(f"Failed to load {model_type}: {e}")
-        # Don't crash - return None and handle gracefully
-        return None
-
-def smart_cache_management():
-    """Intelligent cache management for Render"""
-    global _vector_store_cache, _namespace_cache
-    
-    if len(_vector_store_cache) >= _cache_limit:
-        # Remove oldest entries
-        to_remove = len(_vector_store_cache) - _cache_limit + 1
-        for _ in range(to_remove):
-            if _vector_store_cache:
-                oldest_key = next(iter(_vector_store_cache))
-                del _vector_store_cache[oldest_key]
-                if oldest_key in _namespace_cache:
-                    del _namespace_cache[oldest_key]
-        aggressive_cleanup()
-        logging.info(f"Cache cleaned, {len(_vector_store_cache)} entries remaining")
-
-# --- RENDER-OPTIMIZED LIFESPAN ---
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Optimized startup for Render"""
-    logging.info("🚀 Starting Render-Optimized RAG System...")
-    
-    # Pre-load only embeddings (most critical)
-    try:
-        embeddings_model = get_model_safe("embeddings")
-        if embeddings_model:
-            logging.info("✅ Essential models pre-loaded")
-        else:
-            logging.warning("⚠️ Embeddings pre-load failed - will load on demand")
-    except Exception as e:
-        logging.error(f"Startup error: {e} - continuing with on-demand loading")
-    
-    # Monitor initial memory
-    mem = monitor_memory()
-    logging.info(f"📊 Startup memory usage: {mem:.1f}MB")
-    
-    yield
-    
-    # Cleanup on shutdown
-    logging.info("🔄 Shutting down...")
-    _models.clear()
-    _vector_store_cache.clear()
-    _namespace_cache.clear()
-    aggressive_cleanup()
-    logging.info("✅ Cleanup complete")
-
-# --- FASTAPI APP ---
 app = FastAPI(
-    title="Render-Optimized RAG System",
-    description="Memory-optimized RAG system designed for Render's 512MB limit",
-    version="10.0.0",
-    lifespan=lifespan,
-    docs_url="/docs",
-    redoc_url="/redoc"
+    title="Universal Hybrid Search RAG System",
+    description="Domain-agnostic RAG with adaptive hybrid search for any document type",
+    version="3.0.0"
 )
+
+class HackRxRequest(BaseModel):
+    documents: str = Field(..., description="URL to the PDF document")
+    questions: List[str] = Field(..., description="List of questions to ask about the document")
+
+class HackRxResponse(BaseModel):
+    answers: List[str] = Field(..., description="List of answers corresponding to the questions")
 
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
-async def verify_token(auth_header: str = Security(api_key_header)):
-    if not auth_header:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, 
-            detail="Authorization header missing"
-        )
+# Cache for embeddings and LLM
+_embeddings_cache = None
+_llm_cache = None
+
+def get_memory_usage() -> float:
+    """Get approximate memory usage without psutil"""
     try:
-        scheme, token = auth_header.split(maxsplit=1)
-        if scheme.lower() != "bearer" or token != EXPECTED_BEARER_TOKEN:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN, 
-                detail="Invalid credentials"
+        gc.collect()
+        try:
+            with open('/proc/self/status') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        memory_kb = int(line.split()[1])
+                        return memory_kb / 1024
+        except:
+            pass
+        return 0.0
+    except:
+        return 0.0
+
+def get_cached_embeddings():
+    global _embeddings_cache
+    if _embeddings_cache is None:
+        try:
+            logging.info("Loading universal embeddings model...")
+            _embeddings_cache = HuggingFaceEmbeddings(
+                model_name=EMBEDDING_MODEL_NAME,
+                model_kwargs={'device': 'cpu'},
+                encode_kwargs={'batch_size': 8}
             )
+            logging.info("✅ Universal embeddings loaded successfully")
+        except Exception as e:
+            logging.error(f"Failed to load embeddings: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to load embeddings: {e}")
+    return _embeddings_cache
+
+def get_cached_llm():
+    global _llm_cache
+    if _llm_cache is None:
+        try:
+            _llm_cache = ChatGoogleGenerativeAI(
+                model="gemini-2.0-flash-exp", 
+                temperature=0.1,
+                google_api_key=GOOGLE_API_KEY,
+                max_tokens=400
+            )
+            logging.info("✅ Universal LLM initialized successfully")
+        except Exception as e:
+            logging.error(f"Failed to initialize LLM: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to initialize LLM: {e}")
+    return _llm_cache
+
+async def verify_token(auth_header: str = Security(api_key_header)):
+    if auth_header is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authorization header is missing")
+    try:
+        scheme, token = auth_header.split()
+        if scheme.lower() != "bearer" or token != EXPECTED_BEARER_TOKEN:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid authentication credentials")
     except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, 
-            detail="Invalid authorization format"
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authorization header format")
     return token
 
-# --- DATA MODELS ---
-class HackRxRequest(BaseModel):
-    documents: str = Field(..., description="URL to the PDF document")
-    questions: List[str] = Field(..., description="List of questions")
-
-class HackRxResponse(BaseModel):
-    answers: List[str] = Field(..., description="List of answers")
-
-# --- MEMORY-EFFICIENT DOCUMENT PROCESSING ---
-def get_document_hash(documents: List) -> str:
-    """Generate hash for caching"""
-    if not documents:
-        return "empty"
-    # Use smaller sample for hash to save memory
-    content = "".join([doc.page_content[:50] for doc in documents[:3]])
-    return hashlib.md5(content.encode()).hexdigest()[:8]
-
-def render_optimized_document_processing(url: str) -> List:
-    """Memory-efficient document processing for Render"""
-    temp_file = None
-    try:
-        logging.info(f"📄 Downloading: {url}")
-        
-        # Stream download to save memory
-        response = requests.get(url, timeout=20, stream=True)
-        response.raise_for_status()
-        
-        temp_file = f"temp_{int(time.time())}.pdf"
-        with open(temp_file, "wb") as f:
-            for chunk in response.iter_content(chunk_size=4096):  # Smaller chunks
-                if chunk:
-                    f.write(chunk)
-        
-        # Load and process document
-        loader = PyPDFLoader(temp_file)
-        docs = loader.load()
-        
-        # Clean up temp file immediately
-        os.remove(temp_file)
-        temp_file = None
-        
-        if not docs:
-            raise HTTPException(status_code=400, detail="No content extracted from PDF")
-        
-        # Optimized chunking for Render
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800,  # Smaller chunks for memory efficiency
-            chunk_overlap=100,  # Reduced overlap
-            separators=["\n\n", "\n", ". ", ".", " "],
-            length_function=len
-        )
-        
-        chunks = splitter.split_documents(docs)
-        
-        # Limit chunks to prevent OOM
-        if len(chunks) > _max_chunks_per_doc:
-            logging.warning(f"Limiting chunks from {len(chunks)} to {_max_chunks_per_doc}")
-            chunks = chunks[:_max_chunks_per_doc]
-        
-        logging.info(f"✅ Created {len(chunks)} chunks")
-        
-        # Cleanup before returning
-        del docs, response
-        aggressive_cleanup()
-        
-        return chunks
-        
-    except Exception as e:
-        if temp_file and os.path.exists(temp_file):
-            os.remove(temp_file)
-        logging.error(f"Document processing failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Document processing failed: {str(e)}")
-
-# --- MEMORY-EFFICIENT VECTOR STORE ---
-def create_memory_efficient_vector_store(documents: List) -> PineconeVectorStore:
-    """Create vector store optimized for Render's memory constraints"""
-    start_time = time.time()
+class DocumentAnalyzer:
+    """Adaptive document analysis for domain detection and term importance"""
     
-    try:
-        # Check cache first
-        doc_hash = get_document_hash(documents)
-        cache_key = f"vs_{doc_hash}"
+    @staticmethod
+    def detect_document_domain(documents: List[Document]) -> str:
+        """Automatically detect document domain/type"""
+        all_text = " ".join([doc.page_content for doc in documents[:5]]).lower()
         
-        if cache_key in _vector_store_cache:
-            logging.info(f"📦 Using cached vector store: {doc_hash}")
-            return _vector_store_cache[cache_key]
+        domain_indicators = {
+            'insurance': ['policy', 'premium', 'coverage', 'claim', 'deductible', 'beneficiary'],
+            'legal': ['contract', 'agreement', 'clause', 'whereas', 'party', 'terms'],
+            'medical': ['patient', 'diagnosis', 'treatment', 'medical', 'clinical', 'therapy'],
+            'financial': ['investment', 'portfolio', 'asset', 'liability', 'revenue', 'profit'],
+            'technical': ['system', 'implementation', 'configuration', 'specification', 'architecture'],
+            'academic': ['research', 'study', 'analysis', 'methodology', 'conclusion', 'abstract'],
+            'regulatory': ['regulation', 'compliance', 'requirement', 'standard', 'guideline', 'procedure']
+        }
         
-        # Manage cache before creating new store
-        smart_cache_management()
+        domain_scores = {}
+        for domain, indicators in domain_indicators.items():
+            score = sum(1 for indicator in indicators if indicator in all_text)
+            domain_scores[domain] = score
         
-        # Get embeddings model
-        embeddings = get_model_safe("embeddings")
-        if not embeddings:
-            raise HTTPException(status_code=500, detail="Embeddings model failed to load")
+        detected_domain = max(domain_scores, key=domain_scores.get) if domain_scores else 'general'
+        confidence = domain_scores[detected_domain] / len(domain_indicators[detected_domain])
         
-        # Initialize Pinecone
-        pc = Pinecone(api_key=PINECONE_API_KEY)
-        indexes = pc.list_indexes().names()
-        
-        # Select index
-        if PINECONE_INDEX_NAME in indexes:
-            index_name = PINECONE_INDEX_NAME
-        elif "hackerx" in indexes:
-            index_name = "hackerx"
-        elif "bajajhackerx" in indexes:
-            index_name = "bajajhackerx"
-        else:
-            index_name = indexes[0] if indexes else None
-            
-        if not index_name:
-            raise HTTPException(status_code=404, detail="No suitable Pinecone index found")
-        
-        # Create unique namespace
-        namespace = f"doc_{doc_hash}_{int(time.time())}"
-        
-        # Process documents in small batches to avoid memory spikes
-        logging.info("🔄 Processing documents in memory-efficient batches...")
-        
-        texts = [doc.page_content for doc in documents]
-        metadatas = [{"text": doc.page_content[:300]} for doc in documents]  # Limit metadata size
-        
-        # Create vector store with batch processing
-        vector_store = PineconeVectorStore.from_texts(
-            texts=texts,
-            embedding=embeddings,
-            metadatas=metadatas,
-            index_name=index_name,
-            namespace=namespace
-        )
-        
-        # Cache the result
-        _vector_store_cache[cache_key] = vector_store
-        _namespace_cache[cache_key] = namespace
-        
-        # Cleanup
-        del texts, metadatas
-        aggressive_cleanup()
-        
-        elapsed = time.time() - start_time
-        logging.info(f"✅ Vector store created in {elapsed:.1f}s")
-        
-        return vector_store
-        
-    except Exception as e:
-        aggressive_cleanup()
-        logging.error(f"Vector store creation failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Vector store creation failed: {str(e)}")
-
-# --- LIGHTWEIGHT RAG CHAIN ---
-def create_render_optimized_chain(vector_store: PineconeVectorStore):
-    """Create memory-efficient RAG chain"""
-    llm = get_model_safe("llm")
-    if not llm:
-        raise HTTPException(status_code=500, detail="LLM failed to load")
+        logging.info(f"Detected domain: {detected_domain} (confidence: {confidence:.2f})")
+        return detected_domain
     
-    # Simplified prompt to reduce memory usage
-    prompt_template = """Answer the question based on the provided context. Be specific and accurate.
+    @staticmethod
+    def extract_dynamic_terms(documents: List[Document], top_k: int = 20) -> Dict[str, float]:
+        """Extract important terms dynamically from the document corpus"""
+        all_text = " ".join([doc.page_content for doc in documents]).lower()
+        
+        # Extract all words and calculate frequency
+        words = re.findall(r'\b[a-zA-Z]{3,}\b', all_text)
+        word_freq = Counter(words)
+        
+        # Filter out common stop words
+        stop_words = {
+            'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'had', 'her', 'was',
+            'one', 'our', 'out', 'day', 'get', 'has', 'him', 'his', 'how', 'man', 'new', 'now',
+            'old', 'see', 'two', 'way', 'who', 'boy', 'did', 'its', 'let', 'put', 'say', 'she',
+            'too', 'use', 'will', 'with', 'have', 'this', 'that', 'they', 'from', 'been', 'have',
+            'their', 'said', 'each', 'which', 'there', 'what', 'were', 'when', 'your', 'than'
+        }
+        
+        # Calculate importance scores
+        important_terms = {}
+        total_words = len(words)
+        
+        for word, freq in word_freq.most_common(top_k * 3):
+            if word not in stop_words and len(word) > 3:
+                # TF-IDF-like scoring: frequency * rarity
+                tf = freq / total_words
+                # Simple rarity: longer words and specific patterns get higher scores
+                rarity_score = len(word) / 10  # Longer words are more specific
+                
+                # Boost for capitalized terms (likely proper nouns or important concepts)
+                if any(word.capitalize() in doc.page_content for doc in documents[:3]):
+                    rarity_score *= 1.5
+                
+                # Boost for terms that appear with numbers (likely metrics/values)
+                if any(re.search(rf'\b{word}\b.*?\d+|\d+.*?\b{word}\b', doc.page_content.lower()) 
+                       for doc in documents[:5]):
+                    rarity_score *= 1.3
+                
+                importance_score = tf * rarity_score * 100  # Scale for easier handling
+                important_terms[word] = min(importance_score, 10.0)  # Cap at 10.0
+        
+        # Return top k terms
+        sorted_terms = dict(sorted(important_terms.items(), key=lambda x: x[1], reverse=True)[:top_k])
+        logging.info(f"Dynamic terms extracted: {list(sorted_terms.keys())[:10]}...")
+        return sorted_terms
 
-Context: {context}
-
-Question: {input}
-
-Answer:"""
+class UniversalHybridVectorStore:
+    """Domain-agnostic hybrid search with adaptive term weighting"""
     
-    prompt = PromptTemplate.from_template(prompt_template)
-    document_chain = create_stuff_documents_chain(llm, prompt)
+    def __init__(self, documents: List[Document], embeddings):
+        self.documents = documents
+        self.embeddings = embeddings
+        self.document_embeddings = None
+        
+        # Analyze document domain and extract important terms
+        self.domain = DocumentAnalyzer.detect_document_domain(documents)
+        self.dynamic_terms = DocumentAnalyzer.extract_dynamic_terms(documents)
+        
+        self._precompute_embeddings()
+        logging.info(f"✅ Universal hybrid store created: {len(documents)} docs, domain: {self.domain}")
     
-    # Use smaller retrieval count for memory efficiency
-    retrieval_chain = create_retrieval_chain(
-        vector_store.as_retriever(search_kwargs={"k": 6}),  # Reduced from 10
-        document_chain
-    )
-    
-    return retrieval_chain
-
-# --- OPTIMIZED QUESTION PROCESSING ---
-async def process_questions_efficiently(questions: List[str], rag_chain) -> List[str]:
-    """Process questions with memory monitoring"""
-    answers = []
-    
-    for i, question in enumerate(questions, 1):
+    def _precompute_embeddings(self):
+        """Precompute embeddings for semantic search"""
         try:
-            # Monitor memory before each question
-            mem_usage = monitor_memory()
+            texts = [doc.page_content for doc in self.documents]
+            self.document_embeddings = self.embeddings.embed_documents(texts)
+            logging.info("✅ Document embeddings precomputed")
+        except Exception as e:
+            logging.warning(f"Failed to precompute embeddings: {e}")
+            self.document_embeddings = None
+    
+    def _adaptive_keyword_search(self, query: str, k: int = 15) -> List[Tuple[Document, float]]:
+        """Adaptive keyword search using dynamically extracted terms"""
+        query_lower = query.lower()
+        query_words = set(re.findall(r'\b\w+\b', query_lower))
+        
+        scored_docs = []
+        for doc in self.documents:
+            content_lower = doc.page_content.lower()
+            content_words = set(re.findall(r'\b\w+\b', content_lower))
             
-            if mem_usage > 480:  # Critical memory usage
-                logging.warning(f"Critical memory usage: {mem_usage:.1f}MB - forcing cleanup")
-                aggressive_cleanup()
+            # Basic keyword overlap
+            overlap_score = len(query_words.intersection(content_words))
             
-            # Process question
-            result = rag_chain.invoke({"input": question.strip()})
-            answer = result.get("answer", "Information not found in the provided context.")
-            answers.append(answer)
+            # Exact phrase matching (always important)
+            phrase_score = 8.0 if query_lower in content_lower else 0
             
-            # Cleanup every 2 questions on Render
-            if i % 2 == 0:
-                aggressive_cleanup()
+            # Dynamic term boosting based on document-specific important terms
+            dynamic_boost = 0
+            for term, weight in self.dynamic_terms.items():
+                if term in query_lower and term in content_lower:
+                    dynamic_boost += weight
             
-            logging.info(f"✅ Question {i}/{len(questions)} processed")
+            # Numerical pattern matching (universal across domains)
+            query_numbers = re.findall(r'\b\d+\b', query_lower)
+            content_numbers = re.findall(r'\b\d+\b', content_lower)
+            number_score = len(set(query_numbers).intersection(set(content_numbers))) * 3.0
+            
+            # Question-specific term boosting (adaptive)
+            question_boost = 0
+            question_patterns = ['what', 'how', 'when', 'where', 'why', 'which', 'who']
+            if any(pattern in query_lower for pattern in question_patterns):
+                # Boost informational content patterns
+                info_patterns = ['definition', 'explanation', 'description', 'meaning', 'purpose']
+                for pattern in info_patterns:
+                    if pattern in content_lower:
+                        question_boost += 2.0
+            
+            total_score = overlap_score + phrase_score + dynamic_boost + number_score + question_boost
+            scored_docs.append((doc, total_score))
+        
+        scored_docs.sort(key=lambda x: x[1], reverse=True)
+        return scored_docs[:k]
+    
+    def _semantic_search(self, query: str, k: int = 15) -> List[Tuple[Document, float]]:
+        """Universal semantic search (domain-agnostic)"""
+        if self.document_embeddings is None:
+            return []
+        
+        try:
+            query_embedding = self.embeddings.embed_query(query)
+            
+            similarities = []
+            for i, doc_embedding in enumerate(self.document_embeddings):
+                dot_product = sum(a * b for a, b in zip(query_embedding, doc_embedding))
+                magnitude_q = math.sqrt(sum(a * a for a in query_embedding))
+                magnitude_d = math.sqrt(sum(a * a for a in doc_embedding))
+                
+                if magnitude_q > 0 and magnitude_d > 0:
+                    similarity = dot_product / (magnitude_q * magnitude_d)
+                else:
+                    similarity = 0.0
+                
+                similarities.append((self.documents[i], similarity))
+            
+            similarities.sort(key=lambda x: x[1], reverse=True)
+            return similarities[:k]
             
         except Exception as e:
-            logging.error(f"❌ Question {i} failed: {e}")
-            answers.append(f"Error processing question: {str(e)}")
-            aggressive_cleanup()  # Cleanup on error
+            logging.warning(f"Semantic search failed: {e}")
+            return []
     
-    return answers
+    def universal_hybrid_search(self, query: str, k: int = 8) -> List[Document]:
+        """Universal hybrid search that adapts to any document domain"""
+        
+        # Get results from both search methods
+        keyword_results = self._adaptive_keyword_search(query, k=12)
+        semantic_results = self._semantic_search(query, k=12)
+        
+        logging.info(f"Adaptive keyword search: {len(keyword_results)} results")
+        logging.info(f"Semantic search: {len(semantic_results)} results")
+        
+        # Adaptive weighting based on domain and query characteristics
+        keyword_weight, semantic_weight = self._determine_search_weights(query)
+        
+        # Combine results with adaptive weighting
+        combined_scores = {}
+        
+        for doc, score in keyword_results:
+            doc_id = id(doc)
+            combined_scores[doc_id] = {
+                'doc': doc,
+                'keyword_score': score * keyword_weight,
+                'semantic_score': 0.0
+            }
+        
+        for doc, score in semantic_results:
+            doc_id = id(doc)
+            if doc_id in combined_scores:
+                combined_scores[doc_id]['semantic_score'] = score * semantic_weight
+            else:
+                combined_scores[doc_id] = {
+                    'doc': doc,
+                    'keyword_score': 0.0,
+                    'semantic_score': score * semantic_weight
+                }
+        
+        # Calculate final scores and sort
+        final_results = []
+        for doc_data in combined_scores.values():
+            total_score = doc_data['keyword_score'] + doc_data['semantic_score']
+            final_results.append((doc_data['doc'], total_score))
+        
+        final_results.sort(key=lambda x: x[1], reverse=True)
+        top_docs = [doc for doc, score in final_results[:k]]
+        
+        if final_results:
+            logging.info(f"Universal hybrid search: Top score {final_results[0][1]:.3f}")
+        
+        return top_docs
+    
+    def _determine_search_weights(self, query: str) -> Tuple[float, float]:
+        """Adaptively determine keyword vs semantic weights based on query characteristics"""
+        query_lower = query.lower()
+        
+        # Default balanced weights
+        keyword_weight = 0.5
+        semantic_weight = 0.5
+        
+        # Adjust based on query patterns
+        if any(term in query_lower for term in ['what is', 'define', 'meaning', 'explanation']):
+            # Conceptual questions benefit more from semantic search
+            semantic_weight = 0.7
+            keyword_weight = 0.3
+        elif any(term in query_lower for term in ['how much', 'how many', 'percentage', 'rate']):
+            # Numerical questions benefit from keyword precision
+            keyword_weight = 0.7
+            semantic_weight = 0.3
+        elif re.search(r'\b\d+\b', query_lower):
+            # Queries with numbers need keyword precision
+            keyword_weight = 0.6
+            semantic_weight = 0.4
+        elif len(query_lower.split()) > 10:
+            # Complex queries benefit from semantic understanding
+            semantic_weight = 0.6
+            keyword_weight = 0.4
+        
+        return keyword_weight, semantic_weight
 
-# --- MAIN ENDPOINT ---
+def load_and_chunk_document_from_url(url: str) -> List[Document]:
+    """Universal document loading with adaptive chunking"""
+    logging.info(f"Loading document for universal processing: {url}")
+    try:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        
+        temp_file_path = "temp_document.pdf"
+        with open(temp_file_path, "wb") as temp_f:
+            temp_f.write(response.content)
+        
+        # Universal chunking strategy (not domain-specific)
+        loader = PyPDFLoader(temp_file_path)
+        docs = loader.load_and_split(
+            text_splitter=RecursiveCharacterTextSplitter(
+                chunk_size=1000,  # Balanced for most document types
+                chunk_overlap=200,  # Sufficient overlap for context
+                separators=["\n\n", "\n", ". ", ".", " ", ""]
+            )
+        )
+        
+        logging.info(f"Universal chunking: {len(docs)} chunks created")
+        
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        
+        return docs
+
+    except Exception as e:
+        logging.error(f"Failed to load document: {e}")
+        if os.path.exists("temp_document.pdf"):
+            os.remove("temp_document.pdf")
+        raise HTTPException(status_code=500, detail=f"Document processing failed: {e}")
+
+def clear_pinecone_index():
+    """Clear Pinecone index for fresh processing"""
+    try:
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        existing_indexes = pc.list_indexes().names()
+        
+        if PINECONE_INDEX_NAME in existing_indexes:
+            index = pc.Index(PINECONE_INDEX_NAME)
+            index.delete(delete_all=True)
+            logging.info("✅ Vector index cleared")
+            time.sleep(2)
+    except Exception as e:
+        logging.warning(f"Failed to clear index: {e}")
+
+def create_universal_vector_store(documents: List[Document]) -> UniversalHybridVectorStore:
+    """Create universal hybrid vector store"""
+    logging.info("Creating universal hybrid vector store...")
+    
+    try:
+        clear_pinecone_index()
+        embeddings = get_cached_embeddings()
+        
+        # Create adaptive hybrid store
+        hybrid_store = UniversalHybridVectorStore(documents, embeddings)
+        
+        logging.info("✅ Universal hybrid vector store ready")
+        return hybrid_store
+        
+    except Exception as e:
+        logging.error(f"Failed to create universal vector store: {e}")
+        raise HTTPException(status_code=500, detail=f"Vector store creation failed: {e}")
+
+def create_universal_rag_chain(vector_store: UniversalHybridVectorStore):
+    """Create universal RAG chain with domain-agnostic prompting"""
+    logging.info("Creating universal RAG chain...")
+    
+    try:
+        llm = get_cached_llm()
+        
+        # Universal prompt template (no domain assumptions)
+        template = """You are an expert document analyst. Use the provided document sections to answer the question accurately and comprehensively.
+
+INSTRUCTIONS:
+- Base your answer strictly on the provided document sections
+- Extract specific details, numbers, conditions, and requirements when mentioned
+- Maintain accuracy and cite exact information from the text
+- If the information is not available in the provided sections, clearly state this
+- Provide clear, well-structured answers that directly address the question
+
+DOCUMENT SECTIONS:
+{context}
+
+QUESTION: {question}
+
+COMPREHENSIVE ANSWER:"""
+        
+        rag_prompt = PromptTemplate.from_template(template)
+        
+        # Universal retrieval function
+        def universal_retriever(query: str) -> List[Document]:
+            docs = vector_store.universal_hybrid_search(query, k=10)
+            logging.info(f"Universal retrieval: {len(docs)} documents for query")
+            return docs
+        
+        # Build universal RAG chain
+        rag_chain = (
+            {"context": lambda x: format_docs(universal_retriever(x)), "question": RunnablePassthrough()}
+            | rag_prompt
+            | llm
+            | StrOutputParser()
+        )
+        
+        logging.info("✅ Universal RAG chain created")
+        return rag_chain
+        
+    except Exception as e:
+        logging.error(f"Failed to create universal RAG chain: {e}")
+        raise HTTPException(status_code=500, detail=f"RAG chain creation failed: {e}")
+
+def format_docs(docs: List[Document]) -> str:
+    """Universal document formatting"""
+    formatted_sections = []
+    for i, doc in enumerate(docs, 1):
+        formatted_sections.append(f"--- Section {i} ---\n{doc.page_content}")
+    return "\n\n".join(formatted_sections)
+
 @app.post("/hackrx/run", response_model=HackRxResponse, dependencies=[Depends(verify_token)])
 async def run_submission(request: HackRxRequest):
-    """Render-optimized main processing endpoint"""
+    logging.info("🚀 Processing with universal hybrid search...")
     start_time = time.time()
     
     try:
-        logging.info(f"🚀 Processing {len(request.questions)} questions...")
+        # Universal document processing
+        documents = load_and_chunk_document_from_url(request.documents)
+        vector_store = create_universal_vector_store(documents)
+        rag_chain = create_universal_rag_chain(vector_store)
         
-        # Monitor initial memory
-        initial_mem = monitor_memory()
-        logging.info(f"📊 Initial memory: {initial_mem:.1f}MB")
+        # Process questions universally
+        answers = []
+        for i, question in enumerate(request.questions, 1):
+            logging.info(f"Processing question {i}: '{question[:60]}...'")
+            
+            try:
+                answer = rag_chain.invoke(question)
+                answers.append(answer.strip())
+                logging.info(f"✅ Question {i} completed")
+                
+            except Exception as e:
+                logging.error(f"Error on question {i}: {e}")
+                answers.append(f"Error processing question: {str(e)}")
         
-        # Process document
-        documents = render_optimized_document_processing(request.documents)
-        
-        # Create vector store
-        vector_store = create_memory_efficient_vector_store(documents)
-        
-        # Create RAG chain
-        rag_chain = create_render_optimized_chain(vector_store)
-        
-        # Process questions
-        answers = await process_questions_efficiently(request.questions, rag_chain)
-        
-        # Final cleanup
-        aggressive_cleanup()
-        
-        # Report performance
         total_time = time.time() - start_time
-        final_mem = monitor_memory()
-        logging.info(f"✅ Completed in {total_time:.1f}s, memory: {final_mem:.1f}MB")
+        logging.info(f"✅ Universal processing complete in {total_time:.2f}s")
         
+        gc.collect()
         return HackRxResponse(answers=answers)
         
-    except HTTPException:
-        aggressive_cleanup()
-        raise
     except Exception as e:
-        aggressive_cleanup()
-        logging.error(f"❌ Processing failed: {e}")
+        logging.error(f"Universal processing error: {e}")
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
-# --- UTILITY ENDPOINTS ---
 @app.get("/health")
 async def health_check():
-    mem = monitor_memory()
+    memory_usage = get_memory_usage()
     return {
-        "status": "healthy",
-        "version": "10.0.0",
-        "memory_mb": round(mem, 1),
-        "message": "Render-Optimized RAG System"
+        "status": "healthy", 
+        "message": "Universal Hybrid Search RAG API",
+        "version": "3.0.0",
+        "memory_mb": f"{memory_usage:.1f}" if memory_usage > 0 else "monitoring_unavailable",
+        "features": [
+            "Domain-agnostic hybrid search",
+            "Dynamic term extraction",
+            "Adaptive search weighting",
+            "Universal document processing"
+        ],
+        "embeddings_loaded": _embeddings_cache is not None,
+        "llm_loaded": _llm_cache is not None
     }
 
 @app.get("/")
 async def root():
     return {
-        "message": "Render-Optimized RAG System",
-        "version": "10.0.0",
-        "optimizations": [
-            "Aggressive memory management",
-            "Batch processing with cleanup",
-            "Limited document chunks (100 max)",
-            "Smart caching (2 entries max)",
-            "Memory monitoring",
-            "Render-specific tuning"
+        "message": "Universal Hybrid Search RAG System",
+        "version": "3.0.0",
+        "features": [
+            "Automatic domain detection",
+            "Dynamic important term extraction", 
+            "Adaptive keyword + semantic search",
+            "Universal document compatibility",
+            "No hardcoded domain assumptions"
         ],
-        "memory_limit": "512MB",
-        "platform": "Render"
+        "docs": "/docs",
+        "health": "/health"
     }
 
-@app.get("/memory-status")
-async def memory_status():
-    """Detailed memory status for monitoring"""
-    mem = monitor_memory()
-    return {
-        "memory_mb": round(mem, 1),
-        "memory_percent": round((mem / 512) * 100, 1),
-        "status": "OK" if mem < 350 else "WARNING" if mem < 450 else "CRITICAL",
-        "models_loaded": list(_models.keys()),
-        "vector_stores_cached": len(_vector_store_cache),
-        "cache_limit": _cache_limit,
-        "recommendations": [
-            "Clear cache if memory > 80%" if mem > 400 else "Memory usage normal",
-            f"Current usage: {(mem/512)*100:.1f}% of 512MB limit"
-        ]
-    }
+@app.on_event("startup")
+async def startup_event():
+    logging.info("🚀 Starting Universal RAG System...")
+    try:
+        get_cached_embeddings()
+        logging.info("✅ Universal embeddings ready")
+    except Exception as e:
+        logging.warning(f"⚠️ Embeddings will load on demand: {e}")
+    
+    memory_usage = get_memory_usage()
+    logging.info(f"📊 Startup memory: {memory_usage:.1f}MB")
+    logging.info("🌍 Universal system ready for any document domain")
 
-@app.post("/clear-cache")
-async def clear_cache():
-    """Emergency cache clearing endpoint"""
-    cleared_models = len(_models)
-    cleared_cache = len(_vector_store_cache)
-    
-    _models.clear()
-    _vector_store_cache.clear()
-    _namespace_cache.clear()
-    aggressive_cleanup()
-    
-    new_mem = monitor_memory()
-    
-    return {
-        "message": "Cache cleared successfully",
-        "models_cleared": cleared_models,
-        "cache_cleared": cleared_cache,
-        "memory_after_cleanup_mb": round(new_mem, 1),
-        "status": "success"
-    }
-
-# --- MAIN ---
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
-    print("🚀 Starting Render-Optimized RAG System...")
-    print("💾 Memory Limit: 512MB")
-    print("🔧 Optimizations: Aggressive cleanup + Smart caching + Memory monitoring")
-    print(f"🎯 Port: {port}")
-    print("📚 Docs: /docs")
-    print("💚 Health: /health")
-    print("📊 Memory: /memory-status")
-    
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=port,
-        workers=1,
-        reload=False,
-        access_log=False,  # Reduce logging overhead
-        log_level="info"
-    )
+    port = int(os.environ.get("PORT", 10000))
+    print("🚀 Universal Hybrid Search RAG System")
+    print("🌍 Domain-agnostic | Works with any document type")
+    print("🔍 Adaptive hybrid search with dynamic term extraction")
+    print(f"🎯 Running on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
